@@ -432,7 +432,7 @@ func TestOpenAIResponses_RejectsMessageIDAsPreviousResponseID(t *testing.T) {
 	require.Contains(t, w.Body.String(), "previous_response_id must be a response.id")
 }
 
-func TestOpenAIResponses_NormalizesCompatibilityModelsBeforeValidation(t *testing.T) {
+func TestOpenAIResponses_StrictModelModePreservesRequestedModelBeforeValidation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	tests := []struct {
@@ -443,7 +443,12 @@ func TestOpenAIResponses_NormalizesCompatibilityModelsBeforeValidation(t *testin
 		{
 			name:         "alias_gpt_5_4_pro",
 			requestModel: "gpt-5.4-pro",
-			wantModel:    "gpt-5.4",
+			wantModel:    "gpt-5.4-pro",
+		},
+		{
+			name:         "versioned_gpt_5_4",
+			requestModel: "gpt-5.4-2026-03-05",
+			wantModel:    "gpt-5.4-2026-03-05",
 		},
 		{
 			name:         "canonical_gpt_5_4",
@@ -489,6 +494,114 @@ func TestOpenAIResponses_NormalizesCompatibilityModelsBeforeValidation(t *testin
 			normalizedBody, ok := bodyValue.([]byte)
 			require.True(t, ok)
 			require.Equal(t, tt.wantModel, gjson.GetBytes(normalizedBody, "model").String())
+		})
+	}
+}
+
+func TestOpenAIChatCompletions_StrictModelModePreservesRequestedModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name         string
+		requestModel string
+	}{
+		{name: "gpt_5_4_pro", requestModel: "gpt-5.4-pro"},
+		{name: "gpt_5_4_versioned", requestModel: "gpt-5.4-2026-03-05"},
+		{name: "gpt_5_4", requestModel: "gpt-5.4"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			body := fmt.Sprintf(`{"model":%q,"stream":false,"messages":[{"role":"user","content":"hello"}]}`, tt.requestModel)
+			c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			groupID := int64(2)
+			c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{
+				ID:      101,
+				GroupID: &groupID,
+				User:    &service.User{ID: 1},
+			})
+			c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{
+				UserID:      1,
+				Concurrency: 1,
+			})
+
+			h := newOpenAIHandlerForPreviousResponseIDValidation(t, nil)
+			h.proxyCompatibilityRequestToResponses(c, service.OpenAICompatibilityModeChatCompletions, func(raw []byte) ([]byte, error) {
+				require.Equal(t, tt.requestModel, gjson.GetBytes(raw, "model").String())
+				return []byte(fmt.Sprintf(
+					`{"model":%q,"stream":false,"input":[{"type":"function_call_output","output":"hello"}]}`,
+					tt.requestModel,
+				)), nil
+			})
+
+			require.Equal(t, http.StatusBadRequest, w.Code)
+			require.Contains(t, w.Body.String(), "function_call_output requires call_id or previous_response_id")
+			modelValue, ok := c.Get(opsModelKey)
+			require.True(t, ok)
+			require.Equal(t, tt.requestModel, modelValue)
+
+			bodyValue, ok := c.Get(opsRequestBodyKey)
+			require.True(t, ok)
+			convertedBody, ok := bodyValue.([]byte)
+			require.True(t, ok)
+			require.Equal(t, tt.requestModel, gjson.GetBytes(convertedBody, "model").String())
+		})
+	}
+}
+
+func TestOpenAICompletions_StrictModelModePreservesRequestedModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name         string
+		requestModel string
+	}{
+		{name: "gpt_5_4_pro", requestModel: "gpt-5.4-pro"},
+		{name: "gpt_5_4_versioned", requestModel: "gpt-5.4-2026-03-05"},
+		{name: "gpt_5_4", requestModel: "gpt-5.4"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			body := fmt.Sprintf(`{"model":%q,"stream":false,"prompt":"hello"}`, tt.requestModel)
+			c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/completions", strings.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			groupID := int64(2)
+			c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{
+				ID:      101,
+				GroupID: &groupID,
+				User:    &service.User{ID: 1},
+			})
+			c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{
+				UserID:      1,
+				Concurrency: 1,
+			})
+
+			h := newOpenAIHandlerForPreviousResponseIDValidation(t, nil)
+			h.proxyCompatibilityRequestToResponses(c, service.OpenAICompatibilityModeCompletions, func(raw []byte) ([]byte, error) {
+				require.Equal(t, tt.requestModel, gjson.GetBytes(raw, "model").String())
+				return []byte(fmt.Sprintf(
+					`{"model":%q,"stream":false,"input":[{"type":"function_call_output","output":"hello"}]}`,
+					tt.requestModel,
+				)), nil
+			})
+
+			require.Equal(t, http.StatusBadRequest, w.Code)
+			require.Contains(t, w.Body.String(), "function_call_output requires call_id or previous_response_id")
+			modelValue, ok := c.Get(opsModelKey)
+			require.True(t, ok)
+			require.Equal(t, tt.requestModel, modelValue)
+
+			bodyValue, ok := c.Get(opsRequestBodyKey)
+			require.True(t, ok)
+			convertedBody, ok := bodyValue.([]byte)
+			require.True(t, ok)
+			require.Equal(t, tt.requestModel, gjson.GetBytes(convertedBody, "model").String())
 		})
 	}
 }

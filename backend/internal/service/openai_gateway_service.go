@@ -1478,6 +1478,111 @@ func (s *OpenAIGatewayService) shouldFailoverUpstreamError(statusCode int) bool 
 	}
 }
 
+type openAIModelAvailabilityError struct {
+	Type    string
+	Code    string
+	Message string
+}
+
+func detectOpenAIModelAvailabilityError(statusCode int, body []byte) (openAIModelAvailabilityError, bool) {
+	upstreamCode := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	upstreamType := strings.TrimSpace(gjson.GetBytes(body, "error.type").String())
+	upstreamParam := strings.TrimSpace(gjson.GetBytes(body, "error.param").String())
+	upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(body)))
+	if !isOpenAIModelAvailabilitySignal(statusCode, upstreamCode, upstreamType, upstreamParam, upstreamMsg) {
+		return openAIModelAvailabilityError{}, false
+	}
+
+	if upstreamType == "" {
+		upstreamType = "invalid_request_error"
+	}
+	if upstreamCode == "" {
+		upstreamCode = inferOpenAIModelAvailabilityCode(upstreamMsg)
+	}
+	if upstreamCode == "" {
+		upstreamCode = "model_not_found"
+	}
+	if upstreamMsg == "" {
+		upstreamMsg = "Requested model is unavailable"
+	}
+
+	return openAIModelAvailabilityError{
+		Type:    upstreamType,
+		Code:    upstreamCode,
+		Message: upstreamMsg,
+	}, true
+}
+
+func isOpenAIModelAvailabilitySignal(statusCode int, upstreamCode, upstreamType, upstreamParam, upstreamMsg string) bool {
+	code := strings.ToLower(strings.TrimSpace(upstreamCode))
+	errType := strings.ToLower(strings.TrimSpace(upstreamType))
+	param := strings.ToLower(strings.TrimSpace(upstreamParam))
+	msg := strings.ToLower(strings.TrimSpace(upstreamMsg))
+
+	switch code {
+	case "model_not_found", "unsupported_model", "model_unsupported", "unsupported":
+		return true
+	}
+	if param == "model" && statusCode >= 400 {
+		if strings.Contains(msg, "model") && (strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist") || strings.Contains(msg, "unsupported") || strings.Contains(msg, "not supported") || strings.Contains(msg, "unavailable")) {
+			return true
+		}
+	}
+	if strings.Contains(errType, "model") {
+		return true
+	}
+	if strings.Contains(msg, "model_not_found") || strings.Contains(msg, "unsupported_model") || strings.Contains(msg, "model not found") || strings.Contains(msg, "model does not exist") || strings.Contains(msg, "unsupported model") || strings.Contains(msg, "model is not supported") {
+		return true
+	}
+	return false
+}
+
+func inferOpenAIModelAvailabilityCode(upstreamMsg string) string {
+	msg := strings.ToLower(strings.TrimSpace(upstreamMsg))
+	switch {
+	case strings.Contains(msg, "unsupported"):
+		return "unsupported_model"
+	case strings.Contains(msg, "not found"), strings.Contains(msg, "does not exist"), strings.Contains(msg, "unavailable"):
+		return "model_not_found"
+	default:
+		return ""
+	}
+}
+
+func logOpenAIModelResolution(ctx context.Context, account *Account, requestedModel, upstreamModel string, reqStream, passthrough bool, clientTransport OpenAIClientTransport) {
+	requestedModel = strings.TrimSpace(requestedModel)
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if requestedModel == "" && upstreamModel == "" {
+		return
+	}
+	if upstreamModel == "" {
+		upstreamModel = requestedModel
+	}
+	if requestedModel == "" {
+		requestedModel = upstreamModel
+	}
+
+	fields := []zap.Field{
+		zap.String("component", "service.openai_gateway"),
+		zap.String("requested_model", requestedModel),
+		zap.String("upstream_model", upstreamModel),
+		zap.Bool("stream", reqStream),
+		zap.Bool("passthrough", passthrough),
+	}
+	if account != nil {
+		fields = append(fields,
+			zap.Int64("account_id", account.ID),
+			zap.String("account_name", strings.TrimSpace(account.Name)),
+			zap.String("account_type", strings.TrimSpace(account.Type)),
+		)
+	}
+	if transport := strings.TrimSpace(string(clientTransport)); transport != "" {
+		fields = append(fields, zap.String("client_transport", transport))
+	}
+
+	logger.FromContext(ctx).With(fields...).Info("OpenAI model resolution")
+}
+
 func (s *OpenAIGatewayService) handleFailoverSideEffects(ctx context.Context, resp *http.Response, account *Account) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, body)
@@ -1540,7 +1645,24 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	if passthroughEnabled {
 		// 透传分支只需要轻量提取字段，避免热路径全量 Unmarshal。
 		reasoningEffort := extractOpenAIReasoningEffortFromBody(body, reqModel)
-		return s.forwardOpenAIPassthrough(ctx, c, account, originalBody, reqModel, reasoningEffort, reqStream, startTime)
+		passthroughBody := originalBody
+		upstreamModel := reqModel
+		if mappedModel := strings.TrimSpace(account.GetMappedModel(reqModel)); mappedModel != "" {
+			upstreamModel = mappedModel
+		}
+		if upstreamModel == "" {
+			upstreamModel = reqModel
+		}
+		if upstreamModel != "" && upstreamModel != reqModel {
+			nextBody, setErr := sjson.SetBytes(passthroughBody, "model", upstreamModel)
+			if setErr != nil {
+				return nil, fmt.Errorf("apply passthrough model mapping: %w", setErr)
+			}
+			passthroughBody = nextBody
+		}
+		logOpenAIModelResolution(ctx, account, reqModel, upstreamModel, reqStream, true, clientTransport)
+		reasoningEffort = extractOpenAIReasoningEffortFromBody(passthroughBody, reqModel)
+		return s.forwardOpenAIPassthrough(ctx, c, account, passthroughBody, reqModel, reasoningEffort, reqStream, startTime)
 	}
 
 	reqBody, err := getOpenAIRequestBodyMap(c, body)
@@ -1630,15 +1752,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 
 	// 针对所有 OpenAI 账号执行 Codex 模型名规范化，确保上游识别一致。
 	if model, ok := reqBody["model"].(string); ok {
-		normalizedModel := normalizeCodexModel(model)
-		if normalizedModel != "" && normalizedModel != model {
-			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Codex model normalization: %s -> %s (account: %s, type: %s, isCodexCLI: %v)",
-				model, normalizedModel, account.Name, account.Type, isCodexCLI)
-			reqBody["model"] = normalizedModel
-			mappedModel = normalizedModel
-			bodyModified = true
-			markPatchSet("model", normalizedModel)
-		}
+		_ = model
 	}
 
 	// 规范化 reasoning.effort 参数（minimal -> none），与上游允许值对齐。
@@ -1751,6 +1865,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 		}
 	}
+
+	logOpenAIModelResolution(ctx, account, originalModel, mappedModel, reqStream, false, clientTransport)
 
 	// Get access token
 	token, _, err := s.GetAccessToken(ctx, account)
@@ -1976,11 +2092,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 
 	// Handle error response
 	if resp.StatusCode >= 400 {
-		if s.shouldFailoverUpstreamError(resp.StatusCode) {
-			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-			_ = resp.Body.Close()
-			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
+		_, modelErr := detectOpenAIModelAvailabilityError(resp.StatusCode, respBody)
+		if s.shouldFailoverUpstreamError(resp.StatusCode) && !modelErr {
 			upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
 			upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 			upstreamDetail := ""
@@ -2005,7 +2122,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			s.handleFailoverSideEffects(ctx, resp, account)
 			return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseBody: respBody}
 		}
-		return s.handleErrorResponse(ctx, resp, c, account, body)
+		return s.handleErrorResponse(ctx, resp, c, account, body, originalModel, mappedModel)
 	}
 
 	// Handle normal response
@@ -2721,6 +2838,8 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 	c *gin.Context,
 	account *Account,
 	requestBody []byte,
+	requestedModel string,
+	upstreamModel string,
 ) (*OpenAIForwardResult, error) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 
@@ -2746,6 +2865,34 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 			account.Type,
 			truncateForLog(body, s.cfg.Gateway.LogUpstreamErrorBodyMaxBytes),
 		)
+	}
+
+	if modelErr, ok := detectOpenAIModelAvailabilityError(resp.StatusCode, body); ok {
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: resp.StatusCode,
+			UpstreamRequestID:  resp.Header.Get("x-request-id"),
+			Kind:               "http_error",
+			Message:            modelErr.Message,
+			Detail:             upstreamDetail,
+		})
+		logger.FromContext(ctx).With(
+			zap.String("component", "service.openai_gateway"),
+			zap.String("requested_model", strings.TrimSpace(requestedModel)),
+			zap.String("upstream_model", strings.TrimSpace(upstreamModel)),
+			zap.String("error_code", modelErr.Code),
+			zap.Int("upstream_status", resp.StatusCode),
+		).Warn("OpenAI upstream model unavailable")
+		c.JSON(resp.StatusCode, gin.H{
+			"error": gin.H{
+				"type":    modelErr.Type,
+				"code":    modelErr.Code,
+				"message": modelErr.Message,
+			},
+		})
+		return nil, fmt.Errorf("upstream model unavailable: %s", modelErr.Message)
 	}
 
 	if status, errType, errMsg, matched := applyErrorPassthroughRule(

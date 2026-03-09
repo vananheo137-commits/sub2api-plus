@@ -18,6 +18,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 // 编译期接口断言
@@ -1915,6 +1916,127 @@ func TestOpenAIStreamingResponsesCompatibilityUnaffected(t *testing.T) {
 	require.NotNil(t, result)
 	require.Contains(t, rec.Body.String(), `"type":"response.output_text.delta"`)
 	require.NotContains(t, rec.Body.String(), `"object":"chat.completion.chunk"`)
+}
+
+func TestOpenAIForward_StrictModelModePreservesRequestedResponsesModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logSink, restore := captureStructuredLog(t)
+	defer restore()
+
+	tests := []struct {
+		name  string
+		model string
+	}{
+		{name: "gpt_5_4_pro", model: "gpt-5.4-pro"},
+		{name: "gpt_5_4_versioned", model: "gpt-5.4-2026-03-05"},
+		{name: "gpt_5_4", model: "gpt-5.4"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			body := []byte(fmt.Sprintf(`{"model":"%s","stream":false,"input":"hello"}`, tt.model))
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			upstream := &httpUpstreamRecorder{
+				resp: &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+						`{"id":"resp_%s","model":"%s","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+						strings.ReplaceAll(tt.model, ".", "_"),
+						tt.model,
+					))),
+				},
+			}
+
+			svc := &OpenAIGatewayService{
+				cfg:          &config.Config{},
+				httpUpstream: upstream,
+			}
+			account := &Account{
+				ID:          1,
+				Name:        "strict-openai",
+				Platform:    PlatformOpenAI,
+				Type:        AccountTypeAPIKey,
+				Credentials: map[string]any{"api_key": "sk-test"},
+				Status:      StatusActive,
+				Schedulable: true,
+				Concurrency: 1,
+			}
+
+			result, err := svc.Forward(context.Background(), c, account, body)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Equal(t, tt.model, result.Model)
+			require.Equal(t, tt.model, gjson.GetBytes(upstream.lastBody, "model").String())
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Contains(t, rec.Body.String(), tt.model)
+			require.True(t, logSink.ContainsFieldValue("requested_model", tt.model))
+			require.True(t, logSink.ContainsFieldValue("upstream_model", tt.model))
+		})
+	}
+}
+
+func TestOpenAIForward_StrictModelModeDoesNotFailoverOnModelUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name  string
+		model string
+	}{
+		{name: "gpt_5_4_pro", model: "gpt-5.4-pro"},
+		{name: "gpt_5_4_versioned", model: "gpt-5.4-2026-03-05"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			body := []byte(fmt.Sprintf(`{"model":"%s","stream":false,"input":"hello"}`, tt.model))
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			upstream := &httpUpstreamRecorder{
+				resp: &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+						`{"error":{"type":"invalid_request_error","param":"model","code":"model_not_found","message":"The model %s does not exist"}}`,
+						tt.model,
+					))),
+				},
+			}
+
+			svc := &OpenAIGatewayService{
+				cfg:          &config.Config{},
+				httpUpstream: upstream,
+			}
+			account := &Account{
+				ID:          1,
+				Name:        "strict-openai",
+				Platform:    PlatformOpenAI,
+				Type:        AccountTypeAPIKey,
+				Credentials: map[string]any{"api_key": "sk-test"},
+				Status:      StatusActive,
+				Schedulable: true,
+				Concurrency: 1,
+			}
+
+			result, err := svc.Forward(context.Background(), c, account, body)
+			require.Nil(t, result)
+			require.Error(t, err)
+			var failoverErr *UpstreamFailoverError
+			require.False(t, errors.As(err, &failoverErr))
+			require.Equal(t, tt.model, gjson.GetBytes(upstream.lastBody, "model").String())
+			require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+			require.Contains(t, rec.Body.String(), `"code":"model_not_found"`)
+			require.Contains(t, rec.Body.String(), tt.model)
+			require.NotContains(t, rec.Body.String(), `"model":"gpt-5.4"`)
+		})
+	}
 }
 
 func TestOpenAINonStreamingCompletionsCompatibility(t *testing.T) {
