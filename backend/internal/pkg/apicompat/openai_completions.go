@@ -4,37 +4,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 )
 
 // OpenAICompletionsStreamState tracks state while converting Responses SSE
 // events into legacy Completions chunks.
 type OpenAICompletionsStreamState struct {
-	ResponseID          string
-	CreatedAt           int64
-	Model               string
-	OutputTextDeltaSeen map[string]bool
+	ChatState *OpenAIChatCompletionsStreamState
 }
 
 // NewOpenAICompletionsStreamState returns an initialized stream state.
 func NewOpenAICompletionsStreamState(model string) *OpenAICompletionsStreamState {
 	return &OpenAICompletionsStreamState{
-		Model:               strings.TrimSpace(model),
-		OutputTextDeltaSeen: make(map[string]bool),
+		ChatState: NewOpenAIChatCompletionsStreamState(model),
 	}
 }
 
 // OpenAICompletionsToResponses converts a legacy Completions request into a
-// Responses API request body.
+// Responses API request body by first translating it into a Chat Completions
+// request, then reusing the Chat Completions -> Responses path.
 func OpenAICompletionsToResponses(body []byte) ([]byte, error) {
+	chatBody, err := OpenAICompletionsToChatCompletions(body)
+	if err != nil {
+		return nil, err
+	}
+	return OpenAIChatCompletionsToResponses(chatBody)
+}
+
+// OpenAICompletionsToChatCompletions converts a legacy Completions request into
+// a legacy Chat Completions request body.
+func OpenAICompletionsToChatCompletions(body []byte) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parse completions request: %w", err)
 	}
 
-	out := map[string]any{
-		"store": false,
-	}
+	out := map[string]any{}
 
 	if model := strings.TrimSpace(stringFromAny(raw["model"])); model != "" {
 		out["model"] = model
@@ -49,32 +53,71 @@ func OpenAICompletionsToResponses(body []byte) ([]byte, error) {
 		out["top_p"] = topP
 	}
 	if maxTokens, ok := intFromAny(raw["max_tokens"]); ok {
-		out["max_output_tokens"] = maxTokens
+		out["max_tokens"] = maxTokens
+	}
+	if frequencyPenalty, ok := float64FromAny(raw["frequency_penalty"]); ok {
+		out["frequency_penalty"] = frequencyPenalty
+	}
+	if presencePenalty, ok := float64FromAny(raw["presence_penalty"]); ok {
+		out["presence_penalty"] = presencePenalty
+	}
+	if stop, ok := normalizeOpenAIStopSequences(raw["stop"]); ok {
+		out["stop"] = stop
 	}
 
 	if prompt, ok := buildOpenAICompletionsInput(raw["prompt"]); ok {
-		out["input"] = prompt
+		out["messages"] = []any{
+			map[string]any{
+				"role":    "user",
+				"content": prompt,
+			},
+		}
 	}
 
 	return json.Marshal(out)
 }
 
 // ResponsesToOpenAICompletion converts a final Responses JSON body into a
-// legacy Completions JSON body.
+// legacy Completions JSON body by reusing the existing Responses -> Chat
+// Completions conversion and flattening the resulting assistant message.
 func ResponsesToOpenAICompletion(body []byte) ([]byte, error) {
+	chatBody, err := ResponsesToOpenAIChatCompletion(body)
+	if err != nil {
+		return nil, err
+	}
+	return OpenAIChatCompletionToCompletion(chatBody)
+}
+
+// OpenAIChatCompletionToCompletion converts a Chat Completions JSON body into a
+// legacy Completions JSON body.
+func OpenAIChatCompletionToCompletion(body []byte) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("parse responses body: %w", err)
+		return nil, fmt.Errorf("parse chat completions body: %w", err)
 	}
 
-	choice := map[string]any{
-		"text":     extractResponsesCompletionText(raw["output"]),
-		"index":    0,
-		"logprobs": nil,
-		"finish_reason": openAICompletionFinishReason(
-			stringFromAny(raw["status"]),
-			extractIncompleteReason(raw["incomplete_details"]),
-		),
+	rawChoices, _ := raw["choices"].([]any)
+	choices := make([]any, 0, len(rawChoices))
+	for _, item := range rawChoices {
+		choice, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, _ := choice["message"].(map[string]any)
+		choices = append(choices, map[string]any{
+			"text":          flattenOpenAIChatContent(message["content"]),
+			"index":         choiceIndexValue(choice["index"]),
+			"logprobs":      nil,
+			"finish_reason": choice["finish_reason"],
+		})
+	}
+	if len(choices) == 0 {
+		choices = append(choices, map[string]any{
+			"text":          "",
+			"index":         0,
+			"logprobs":      nil,
+			"finish_reason": nil,
+		})
 	}
 
 	out := map[string]any{
@@ -82,9 +125,9 @@ func ResponsesToOpenAICompletion(body []byte) ([]byte, error) {
 		"object":  "text_completion",
 		"created": createdAtFromMap(raw),
 		"model":   stringFromAny(raw["model"]),
-		"choices": []any{choice},
+		"choices": choices,
 	}
-	if usage := buildOpenAIChatUsage(raw["usage"]); len(usage) > 0 {
+	if usage, ok := raw["usage"].(map[string]any); ok && len(usage) > 0 {
 		out["usage"] = usage
 	}
 
@@ -92,8 +135,8 @@ func ResponsesToOpenAICompletion(body []byte) ([]byte, error) {
 }
 
 // ResponsesEventToOpenAICompletions converts one Responses SSE payload into
-// zero or more legacy Completions chunk payloads. The returned boolean
-// indicates whether the stream reached a terminal event and should emit [DONE].
+// zero or more legacy Completions chunk payloads by reusing the existing
+// Responses -> Chat Completions stream conversion and flattening each chunk.
 func ResponsesEventToOpenAICompletions(
 	data []byte,
 	state *OpenAICompletionsStreamState,
@@ -102,58 +145,30 @@ func ResponsesEventToOpenAICompletions(
 		return nil, false, nil
 	}
 
-	var evt ResponsesStreamEvent
-	if err := json.Unmarshal(data, &evt); err != nil {
-		return nil, false, fmt.Errorf("parse responses stream event: %w", err)
-	}
-
 	if state == nil {
 		state = NewOpenAICompletionsStreamState("")
 	}
-	if state.CreatedAt == 0 {
-		state.CreatedAt = time.Now().Unix()
+	if state.ChatState == nil {
+		state.ChatState = NewOpenAIChatCompletionsStreamState("")
 	}
 
-	switch evt.Type {
-	case "response.created":
-		if evt.Response != nil {
-			if state.ResponseID == "" {
-				state.ResponseID = evt.Response.ID
-			}
-			if state.Model == "" {
-				state.Model = evt.Response.Model
-			}
-		}
-		return nil, false, nil
-	case "response.output_text.delta":
-		if evt.Delta == "" {
-			return nil, false, nil
-		}
-		state.OutputTextDeltaSeen[openAICompletionsOutputTextKey(evt)] = true
-		return marshalOpenAICompletionsChunks([]map[string]any{
-			buildOpenAICompletionsChunk(state, evt.Delta, nil, nil),
-		}, false)
-	case "response.output_text.done":
-		if evt.Text == "" {
-			return nil, false, nil
-		}
-		if state.OutputTextDeltaSeen[openAICompletionsOutputTextKey(evt)] {
-			return nil, false, nil
-		}
-		return marshalOpenAICompletionsChunks([]map[string]any{
-			buildOpenAICompletionsChunk(state, evt.Text, nil, nil),
-		}, false)
-	case "response.completed", "response.done", "response.incomplete", "response.failed":
-		finishReason := openAICompletionFinishReason(
-			responseStatusFromEvent(evt),
-			incompleteReasonFromEvent(evt.Response),
-		)
-		return marshalOpenAICompletionsChunks([]map[string]any{
-			buildOpenAICompletionsChunk(state, "", &finishReason, buildOpenAIChatUsageFromResponse(evt.Response)),
-		}, true)
-	default:
-		return nil, false, nil
+	chatPayloads, done, err := ResponsesEventToOpenAIChatCompletions(data, state.ChatState)
+	if err != nil {
+		return nil, false, err
 	}
+	if len(chatPayloads) == 0 {
+		return nil, done, nil
+	}
+
+	out := make([][]byte, 0, len(chatPayloads))
+	for _, payload := range chatPayloads {
+		converted, err := OpenAIChatCompletionChunkToCompletionChunk(payload)
+		if err != nil {
+			return nil, false, err
+		}
+		out = append(out, converted)
+	}
+	return out, done, nil
 }
 
 func buildOpenAICompletionsInput(raw any) (string, bool) {
@@ -189,71 +204,6 @@ func buildOpenAICompletionsInput(raw any) (string, bool) {
 	}
 }
 
-func extractResponsesCompletionText(raw any) string {
-	outputs, ok := raw.([]any)
-	if !ok || len(outputs) == 0 {
-		return ""
-	}
-
-	var builder strings.Builder
-	for _, item := range outputs {
-		output, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		if strings.TrimSpace(stringFromAny(output["type"])) != "message" {
-			continue
-		}
-		builder.WriteString(extractResponsesMessageText(output["content"]))
-	}
-	return builder.String()
-}
-
-func buildOpenAICompletionsChunk(
-	state *OpenAICompletionsStreamState,
-	text string,
-	finishReason *string,
-	usage map[string]any,
-) map[string]any {
-	choice := map[string]any{
-		"text":          text,
-		"index":         0,
-		"logprobs":      nil,
-		"finish_reason": nil,
-	}
-	if finishReason != nil {
-		choice["finish_reason"] = *finishReason
-	}
-
-	chunk := map[string]any{
-		"id":      openAICompletionsResponseID(state),
-		"object":  "text_completion",
-		"created": openAICompletionsCreatedAt(state),
-		"model":   openAICompletionsModel(state),
-		"choices": []any{choice},
-	}
-	if len(usage) > 0 {
-		chunk["usage"] = usage
-	}
-	return chunk
-}
-
-func marshalOpenAICompletionsChunks(chunks []map[string]any, done bool) ([][]byte, bool, error) {
-	if len(chunks) == 0 {
-		return nil, done, nil
-	}
-
-	out := make([][]byte, 0, len(chunks))
-	for _, chunk := range chunks {
-		payload, err := json.Marshal(chunk)
-		if err != nil {
-			return nil, false, err
-		}
-		out = append(out, payload)
-	}
-	return out, done, nil
-}
-
 func openAICompletionFinishReason(status, incompleteReason string) string {
 	switch strings.TrimSpace(status) {
 	case "incomplete":
@@ -270,27 +220,91 @@ func openAICompletionFinishReason(status, incompleteReason string) string {
 	}
 }
 
-func openAICompletionsOutputTextKey(evt ResponsesStreamEvent) string {
-	return fmt.Sprintf("%d:%d", evt.OutputIndex, evt.ContentIndex)
+// OpenAIChatCompletionChunkToCompletionChunk converts a Chat Completions chunk
+// payload into a legacy Completions chunk payload.
+func OpenAIChatCompletionChunkToCompletionChunk(body []byte) ([]byte, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("parse chat completions chunk: %w", err)
+	}
+
+	rawChoices, _ := raw["choices"].([]any)
+	choices := make([]any, 0, len(rawChoices))
+	for _, item := range rawChoices {
+		choice, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		choices = append(choices, map[string]any{
+			"text":          flattenOpenAIChatContent(delta["content"]),
+			"index":         choiceIndexValue(choice["index"]),
+			"logprobs":      nil,
+			"finish_reason": choice["finish_reason"],
+		})
+	}
+	if len(choices) == 0 {
+		choices = append(choices, map[string]any{
+			"text":          "",
+			"index":         0,
+			"logprobs":      nil,
+			"finish_reason": nil,
+		})
+	}
+
+	out := map[string]any{
+		"id":      stringFromAny(raw["id"]),
+		"object":  "text_completion",
+		"created": createdAtFromMap(raw),
+		"model":   stringFromAny(raw["model"]),
+		"choices": choices,
+	}
+	if usage, ok := raw["usage"].(map[string]any); ok && len(usage) > 0 {
+		out["usage"] = usage
+	}
+	return json.Marshal(out)
 }
 
-func openAICompletionsResponseID(state *OpenAICompletionsStreamState) string {
-	if state == nil {
-		return ""
+func normalizeOpenAIStopSequences(raw any) (any, bool) {
+	switch value := raw.(type) {
+	case string:
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, false
+		}
+		return value, true
+	case []string:
+		out := make([]any, 0, len(value))
+		for _, item := range value {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				out = append(out, item)
+			}
+		}
+		if len(out) == 0 {
+			return nil, false
+		}
+		return out, true
+	case []any:
+		out := make([]any, 0, len(value))
+		for _, item := range value {
+			text := strings.TrimSpace(stringFromAny(item))
+			if text != "" {
+				out = append(out, text)
+			}
+		}
+		if len(out) == 0 {
+			return nil, false
+		}
+		return out, true
+	default:
+		return nil, false
 	}
-	return state.ResponseID
 }
 
-func openAICompletionsCreatedAt(state *OpenAICompletionsStreamState) int64 {
-	if state != nil && state.CreatedAt > 0 {
-		return state.CreatedAt
+func choiceIndexValue(raw any) int {
+	if index, ok := intFromAny(raw); ok {
+		return index
 	}
-	return time.Now().Unix()
-}
-
-func openAICompletionsModel(state *OpenAICompletionsStreamState) string {
-	if state == nil {
-		return ""
-	}
-	return state.Model
+	return 0
 }

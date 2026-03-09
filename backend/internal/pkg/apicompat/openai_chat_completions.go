@@ -58,10 +58,19 @@ func OpenAIChatCompletionsToResponses(body []byte) ([]byte, error) {
 	if topP, ok := float64FromAny(raw["top_p"]); ok {
 		out["top_p"] = topP
 	}
+	if frequencyPenalty, ok := float64FromAny(raw["frequency_penalty"]); ok {
+		out["frequency_penalty"] = frequencyPenalty
+	}
+	if presencePenalty, ok := float64FromAny(raw["presence_penalty"]); ok {
+		out["presence_penalty"] = presencePenalty
+	}
 	if maxTokens, ok := intFromAny(raw["max_tokens"]); ok {
 		out["max_output_tokens"] = maxTokens
 	} else if maxTokens, ok := intFromAny(raw["max_completion_tokens"]); ok {
 		out["max_output_tokens"] = maxTokens
+	}
+	if stop, ok := normalizeOpenAIStopSequences(raw["stop"]); ok {
+		out["stop"] = stop
 	}
 	if effort := strings.TrimSpace(stringFromAny(raw["reasoning_effort"])); effort != "" {
 		out["reasoning"] = map[string]any{"effort": effort}
