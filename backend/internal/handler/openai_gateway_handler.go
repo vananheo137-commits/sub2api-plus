@@ -87,7 +87,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusUnauthorized, "authentication_error", "Invalid API key")
 		return
 	}
-
 	subject, ok := middleware2.GetAuthSubjectFromContext(c)
 	if !ok {
 		h.errorResponse(c, http.StatusInternalServerError, "api_error", "User context not found")
@@ -103,7 +102,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	if !h.ensureResponsesDependencies(c, reqLog) {
 		return
 	}
-
 	// Read request body
 	body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
 	if err != nil {
@@ -121,7 +119,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 
 	setOpsRequestContext(c, "", false, body)
-	sessionHashBody := body
 	if service.IsOpenAIResponsesCompactPathForTest(c) {
 		if compactSeed := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()); compactSeed != "" {
 			c.Set(service.OpenAICompactSessionSeedKeyForTest(), compactSeed)
@@ -135,6 +132,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			body = normalizedCompactBody
 		}
 	}
+	normalizedBody, normalizeErr := service.NormalizeOpenAICompatibilityRequestBody(body)
+	if normalizeErr != nil {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+		return
+	}
+	body = normalizedBody
+	setOpsRequestContext(c, "", false, body)
+	sessionHashBody := body
 
 	// 校验请求体 JSON 合法性
 	if !gjson.ValidBytes(body) {
