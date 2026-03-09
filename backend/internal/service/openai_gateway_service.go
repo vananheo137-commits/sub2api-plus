@@ -3339,11 +3339,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 		return nil, err
 	}
 
-	if account.Type == AccountTypeOAuth {
-		bodyLooksLikeSSE := bytes.Contains(body, []byte("data:")) || bytes.Contains(body, []byte("event:"))
-		if isEventStreamResponse(resp.Header) || bodyLooksLikeSSE {
-			return s.handleOAuthSSEToJSON(resp, c, body, originalModel, mappedModel)
-		}
+	bodyLooksLikeSSE := bytes.Contains(body, []byte("data:")) || bytes.Contains(body, []byte("event:"))
+	if isEventStreamResponse(resp.Header) || bodyLooksLikeSSE {
+		return s.handleOAuthSSEToJSON(resp, c, body, originalModel, mappedModel)
 	}
 
 	usageValue, usageOK := extractOpenAIUsageFromJSONBytes(body)
@@ -3424,23 +3422,15 @@ func (s *OpenAIGatewayService) handleOAuthSSEToJSON(resp *http.Response, c *gin.
 			}
 			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 		}
-		usage = s.parseSSEUsageFromBody(bodyText)
-		if originalModel != mappedModel {
-			bodyText = s.replaceModelInSSEBody(bodyText, mappedModel, originalModel)
+		if terminalOK {
+			usage = s.parseSSEUsageFromBody(bodyText)
 		}
-		body = []byte(bodyText)
+		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, "Upstream returned SSE without a terminal JSON response")
 	}
 
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 
-	contentType := "application/json; charset=utf-8"
-	if !ok {
-		contentType = resp.Header.Get("Content-Type")
-		if contentType == "" {
-			contentType = "text/event-stream"
-		}
-	}
-	c.Data(resp.StatusCode, contentType, body)
+	c.Data(resp.StatusCode, "application/json; charset=utf-8", body)
 
 	return usage, nil
 }

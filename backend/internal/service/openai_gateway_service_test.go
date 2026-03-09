@@ -1719,7 +1719,7 @@ func TestHandleOAuthSSEToJSON_CompletedEventReturnsJSON(t *testing.T) {
 	require.NotContains(t, rec.Body.String(), "data:")
 }
 
-func TestHandleOAuthSSEToJSON_NoFinalResponseKeepsSSEBody(t *testing.T) {
+func TestHandleOAuthSSEToJSON_NoFinalResponseReturnsProtocolError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -1736,11 +1736,13 @@ func TestHandleOAuthSSEToJSON_NoFinalResponseKeepsSSEBody(t *testing.T) {
 	}, "\n"))
 
 	usage, err := svc.handleOAuthSSEToJSON(resp, c, body, "gpt-4o", "gpt-4o")
-	require.NoError(t, err)
-	require.NotNil(t, usage)
-	require.Equal(t, 0, usage.InputTokens)
-	require.Contains(t, rec.Header().Get("Content-Type"), "text/event-stream")
-	require.Contains(t, rec.Body.String(), `data: {"type":"response.in_progress"`)
+	require.Nil(t, usage)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+	require.Contains(t, rec.Body.String(), `"type":"upstream_error"`)
+	require.Contains(t, rec.Body.String(), "terminal JSON response")
+	require.NotContains(t, rec.Body.String(), `data: {"type":"response.in_progress"}`)
 }
 
 func TestHandleOAuthSSEToJSON_ResponseFailedReturnsProtocolError(t *testing.T) {
@@ -1797,6 +1799,42 @@ func TestOpenAINonStreamingChatCompletionsCompatibility(t *testing.T) {
 	require.Contains(t, rec.Body.String(), `"content":"hello from compat"`)
 	require.Contains(t, rec.Body.String(), `"prompt_tokens":5`)
 	require.Contains(t, rec.Body.String(), `"completion_tokens":7`)
+}
+
+func TestOpenAINonStreamingChatCompletionsCompatibility_SSEWithoutFinalJSONReturnsJSONError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			ResponseHeaders: config.ResponseHeaderConfig{Enabled: false},
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	SetOpenAICompatibilityMode(c, OpenAICompatibilityModeChatCompletions)
+
+	body := []byte(strings.Join([]string{
+		`data: {"type":"response.in_progress","response":{"id":"resp_stream_only","model":"gpt-5.1"}}`,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`data: [DONE]`,
+	}, "\n"))
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	usage, err := svc.handleNonStreamingResponse(c.Request.Context(), resp, c, &Account{}, "gpt-5.1", "gpt-5.1")
+	require.Nil(t, usage)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+	require.Contains(t, rec.Body.String(), `"type":"upstream_error"`)
+	require.Contains(t, rec.Body.String(), "terminal JSON response")
+	require.NotContains(t, rec.Body.String(), "event:")
+	require.NotContains(t, rec.Body.String(), "data:")
 }
 
 func TestOpenAIStreamingChatCompletionsCompatibility(t *testing.T) {
