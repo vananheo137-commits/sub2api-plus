@@ -1766,3 +1766,191 @@ func TestHandleOAuthSSEToJSON_ResponseFailedReturnsProtocolError(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "upstream rejected request")
 	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
 }
+
+func TestOpenAINonStreamingChatCompletionsCompatibility(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			ResponseHeaders: config.ResponseHeaderConfig{Enabled: false},
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	SetOpenAICompatibilityMode(c, OpenAICompatibilityModeChatCompletions)
+
+	body := []byte(`{"id":"resp_compat","created_at":1700000000,"model":"gpt-5.1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello from compat"}]}],"usage":{"input_tokens":5,"output_tokens":7,"total_tokens":12}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+	}
+
+	usage, err := svc.handleNonStreamingResponse(c.Request.Context(), resp, c, &Account{}, "gpt-5.1", "gpt-5.1")
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	require.Equal(t, 5, usage.InputTokens)
+	require.Equal(t, 7, usage.OutputTokens)
+	require.Contains(t, rec.Body.String(), `"object":"chat.completion"`)
+	require.Contains(t, rec.Body.String(), `"content":"hello from compat"`)
+	require.Contains(t, rec.Body.String(), `"prompt_tokens":5`)
+	require.Contains(t, rec.Body.String(), `"completion_tokens":7`)
+}
+
+func TestOpenAIStreamingChatCompletionsCompatibility(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 0,
+			StreamKeepaliveInterval:   0,
+			MaxLineSize:               defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	SetOpenAICompatibilityMode(c, OpenAICompatibilityModeChatCompletions)
+
+	pr, pw := io.Pipe()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       pr,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	go func() {
+		defer func() { _ = pw.Close() }()
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream\",\"model\":\"gpt-5.1\"}}\n\n"))
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"model\":\"gpt-5.1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n"))
+		_, _ = pw.Write([]byte("data: [DONE]\n\n"))
+	}()
+
+	result, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1}, time.Now(), "gpt-5.1", "gpt-5.1")
+	_ = pr.Close()
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.usage)
+	require.Equal(t, 3, result.usage.InputTokens)
+	require.Equal(t, 4, result.usage.OutputTokens)
+	require.Contains(t, rec.Body.String(), `"object":"chat.completion.chunk"`)
+	require.Contains(t, rec.Body.String(), `"content":"hello"`)
+	require.Contains(t, rec.Body.String(), `"finish_reason":"stop"`)
+	require.Contains(t, rec.Body.String(), `data: [DONE]`)
+}
+
+func TestOpenAIStreamingResponsesCompatibilityUnaffected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 0,
+			StreamKeepaliveInterval:   0,
+			MaxLineSize:               defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	pr, pw := io.Pipe()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       pr,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	go func() {
+		defer func() { _ = pw.Close() }()
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}\n\n"))
+	}()
+
+	result, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1}, time.Now(), "gpt-5.1", "gpt-5.1")
+	_ = pr.Close()
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Contains(t, rec.Body.String(), `"type":"response.output_text.delta"`)
+	require.NotContains(t, rec.Body.String(), `"object":"chat.completion.chunk"`)
+}
+
+func TestOpenAINonStreamingCompletionsCompatibility(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			ResponseHeaders: config.ResponseHeaderConfig{Enabled: false},
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/completions", nil)
+	SetOpenAICompatibilityMode(c, OpenAICompatibilityModeCompletions)
+
+	body := []byte(`{"id":"resp_completion","created_at":1700000000,"model":"gpt-5.1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"plain completion"}]}],"usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+	}
+
+	usage, err := svc.handleNonStreamingResponse(c.Request.Context(), resp, c, &Account{}, "gpt-5.1", "gpt-5.1")
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	require.Equal(t, 4, usage.InputTokens)
+	require.Equal(t, 6, usage.OutputTokens)
+	require.Contains(t, rec.Body.String(), `"object":"text_completion"`)
+	require.Contains(t, rec.Body.String(), `"text":"plain completion"`)
+	require.Contains(t, rec.Body.String(), `"prompt_tokens":4`)
+	require.Contains(t, rec.Body.String(), `"completion_tokens":6`)
+}
+
+func TestOpenAIStreamingCompletionsCompatibility(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 0,
+			StreamKeepaliveInterval:   0,
+			MaxLineSize:               defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/completions", nil)
+	SetOpenAICompatibilityMode(c, OpenAICompatibilityModeCompletions)
+
+	pr, pw := io.Pipe()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       pr,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+
+	go func() {
+		defer func() { _ = pw.Close() }()
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_completion_stream\",\"model\":\"gpt-5.1\"}}\n\n"))
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"hello completion\"}\n\n"))
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_completion_stream\",\"model\":\"gpt-5.1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":5,\"total_tokens\":7}}}\n\n"))
+		_, _ = pw.Write([]byte("data: [DONE]\n\n"))
+	}()
+
+	result, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1}, time.Now(), "gpt-5.1", "gpt-5.1")
+	_ = pr.Close()
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.usage)
+	require.Equal(t, 2, result.usage.InputTokens)
+	require.Equal(t, 5, result.usage.OutputTokens)
+	require.Contains(t, rec.Body.String(), `"object":"text_completion"`)
+	require.Contains(t, rec.Body.String(), `"text":"hello completion"`)
+	require.Contains(t, rec.Body.String(), `"finish_reason":"stop"`)
+	require.Contains(t, rec.Body.String(), `data: [DONE]`)
+}
